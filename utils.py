@@ -13,7 +13,7 @@ import torch
 from collections import Iterable
 from datasets import Dataset
 from scipy.special import expit
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, train_test_split
 from torch.nn import BCEWithLogitsLoss
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data.dataloader import DataLoader
@@ -482,12 +482,15 @@ def load_data(data_dir, n_splits=5, seed=0):
 
     # Get train / val split indices either from new KFold or from disk
     if not os.path.exists('split_indices.joblib'):
+        indices = range(df.shape[0])
+        train, valid, indices_train, indices_valid = train_test_split(df, indices, test_size=0.14, random_state=seed)
+        train, meta, indices_train, indices_meta = train_test_split(train, indices_train, test_size=0.17, random_state=seed)
         kfold = KFold(n_splits, shuffle=True, random_state=seed)
-        split_indices = list(kfold.split(df))
+        split_indices = [indices_train, indices_valid] + list(kfold.split(train))
         joblib.dump(split_indices, 'split_indices.joblib')
     else:
         split_indices = joblib.load('split_indices.joblib')
-        assert len(split_indices[0][0]) + len(split_indices[0][1]) == len(df)
+#        assert len(split_indices[0][0]) + len(split_indices[0][1]) == len(df)
 
     return df, split_indices
 
