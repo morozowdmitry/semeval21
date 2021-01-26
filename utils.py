@@ -13,6 +13,7 @@ import torch
 from collections import Iterable
 from datasets import Dataset
 from scipy.special import expit
+from sklearn.model_selection import train_test_split
 from sklearn.model_selection import KFold
 from torch.nn import BCEWithLogitsLoss
 from torch.optim.lr_scheduler import LambdaLR
@@ -51,10 +52,7 @@ class Converter:
 
     def __call__(self, examples: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
         """Tokenize and converet Semeval data to NER-like data with two classes."""
-        spans_batch, text_batch = examples['spans'], examples['text']
-        
-        # Convert span literal to list
-        spans_batch = [ast.literal_eval(spans) for spans in spans_batch]
+        text_batch = examples['text']
         
         # Obtain tokens and token span intervals
         tokenized_inputs_batch = self.tokenizer(
@@ -67,21 +65,27 @@ class Converter:
             return_special_tokens_mask=self.add_special_tokens
         )
         token_spans_intervals_batch = tokenized_inputs_batch['offset_mapping']
-
-        # Convert label spans to span intervals convert 
-        # (label spans intervals, token span intervals) -> token labels
-        tokenized_inputs_batch["labels"] = [
-            Converter._intervals_to_token_labels(
-                token_spans_intervals, 
-                Converter._spans_to_span_intervals(spans, len(text))
-            )
-            for spans, text, token_spans_intervals in zip(spans_batch, text_batch, token_spans_intervals_batch)
-        ]
         
-        # Save token span intervals and spans for later f1 calculation
+        # Save token span intervals for later f1 calculation
         tokenized_inputs_batch['token_spans_intervals'] = token_spans_intervals_batch
-        tokenized_inputs_batch['spans'] = spans_batch
 
+        if 'spans' in examples:
+            spans_batch = examples['spans']
+
+            # Convert span literal to list
+            spans_batch = [ast.literal_eval(spans) for spans in spans_batch]
+        
+            # Convert label spans to span intervals convert 
+            # (label spans intervals, token span intervals) -> token labels
+            tokenized_inputs_batch["labels"] = [
+                Converter._intervals_to_token_labels(
+                    token_spans_intervals, 
+                    Converter._spans_to_span_intervals(spans, len(text))
+                )
+                for spans, text, token_spans_intervals in zip(spans_batch, text_batch, token_spans_intervals_batch)
+            ]
+            tokenized_inputs_batch['spans'] = spans_batch
+        
         return tokenized_inputs_batch
 
     def _spans_to_span_intervals(spans: List[int], text_len: int) -> List[Tuple[int, int]]:
@@ -161,6 +165,7 @@ class CustomSpansTrainer(Trainer):
         description: str,
         prediction_loss_only: Optional[bool] = None,
         ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: Optional[str] = 'eval'
     ) -> PredictionOutput:
         """
         Prediction/evaluation loop, shared by :obj:`Trainer.evaluate()` and :obj:`Trainer.predict()`.
@@ -229,7 +234,9 @@ class CustomSpansTrainer(Trainer):
                 # Set back to None to begin a new accumulation
                 losses_host, preds_host, labels_host = None, None, None
 
-            spans_info['spans'].extend(inputs['spans'])
+            if 'spans' in inputs:
+                spans_info['spans'].extend(inputs['spans'])
+            
             spans_info['token_spans_intervals'].extend(inputs['token_spans_intervals'])
             if 'special_tokens_mask' in inputs:
                 spans_info['tokens_mask'].extend(inputs['attention_mask'] & (~inputs['special_tokens_mask']))
@@ -250,18 +257,18 @@ class CustomSpansTrainer(Trainer):
         preds = preds_gatherer.finalize() if not prediction_loss_only else None
         label_ids = labels_gatherer.finalize() if not prediction_loss_only else None
 
-        if self.compute_metrics is not None and preds is not None and label_ids is not None:
+        if self.compute_metrics is not None and preds is not None:
             metrics = self.compute_metrics(EvalPrediction(predictions=preds, label_ids=label_ids), spans_info)
         else:
             metrics = {}
 
         if eval_loss is not None:
-            metrics["eval_loss"] = eval_loss.mean().item()
+            metrics[f"{metric_key_prefix}_loss"] = eval_loss.mean().item()
 
         # Prefix all keys with eval_
         for key in list(metrics.keys()):
-            if not key.startswith("eval_"):
-                metrics[f"eval_{key}"] = metrics.pop(key)
+            if not key.startswith(f"{metric_key_prefix}_"):
+                metrics[f"{metric_key_prefix}_{key}"] = metrics.pop(key)
 
         return PredictionOutput(predictions=preds, label_ids=label_ids, metrics=metrics)
 
@@ -344,7 +351,7 @@ def compress_rec(data, selectors):
                 yield d
 
 
-def compute_metrics(p, spans_info, threshold=0.5, raw=False):
+def predict_token_spans(p, spans_info, threshold=0.5):
     """Compute f1 score from classifier predictions, spans and token span intervals"""
     tokens_mask = torch.stack(spans_info['tokens_mask']).cpu().numpy().astype(bool)
 
@@ -359,6 +366,14 @@ def compute_metrics(p, spans_info, threshold=0.5, raw=False):
     # Convert
     token_spans_predicted = map(Converter._span_intervals_to_spans, token_spans_intervals_filtered)
 
+    return token_spans_predicted
+
+
+def compute_metrics(p, spans_info, threshold=0.5, raw=False):
+    """Compute f1 score from classifier predictions, spans and token span intervals"""
+    # Convert
+    token_spans_predicted = predict_token_spans(p, spans_info, threshold)
+
     # Compute f1 for each sample and average it
     f1_char = [f1(token_spans_p, token_spans_l) for token_spans_p, token_spans_l in zip(token_spans_predicted, spans_info['spans'])]
     f1_char_mean = np.mean(f1_char)
@@ -371,6 +386,11 @@ def compute_metrics(p, spans_info, threshold=0.5, raw=False):
         metrics['f1_char'] = f1_char
 
     return metrics
+
+
+def extract_predictions_as_metric(p, spans_info, threshold=0.5):
+    token_spans_predicted = predict_token_spans(p, spans_info, threshold)
+    return {'token_spans_predicted': list(token_spans_predicted)}
 
 
 def build_bert_params_decayed_lr(model, lr, decay_factor=1):
@@ -482,12 +502,15 @@ def load_data(data_dir, n_splits=5, seed=0):
 
     # Get train / val split indices either from new KFold or from disk
     if not os.path.exists('split_indices.joblib'):
+        indices = list(range(df.shape[0]))
+        train, valid, indices_train, indices_valid = train_test_split(df, indices, test_size=0.14, random_state=seed)
+        train, meta, indices_train, indices_meta = train_test_split(train, indices_train, test_size=0.17, random_state=seed)
         kfold = KFold(n_splits, shuffle=True, random_state=seed)
-        split_indices = list(kfold.split(df))
+        split_indices = [indices_train, indices_valid, indices_meta] + list(kfold.split(train))
         joblib.dump(split_indices, 'split_indices.joblib')
     else:
         split_indices = joblib.load('split_indices.joblib')
-        assert len(split_indices[0][0]) + len(split_indices[0][1]) == len(df)
+        assert (len(split_indices[0]) + len(split_indices[1]) + len(split_indices[2])) == len(df)
 
     return df, split_indices
 
